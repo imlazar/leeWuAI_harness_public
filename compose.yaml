@@ -1,0 +1,342 @@
+name: homelab-ai-stack
+
+networks:
+  stack_net:
+    driver: bridge
+
+services:
+  # ==============================================================================
+  # 1. CORE DATABASE (PostgreSQL 15 + pgvector)
+  # Shared by Supabase, Honcho, and n8n
+  # ==============================================================================
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: stack-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres123}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 2. REDIS (Cache for Honcho & background jobs)
+  # ==============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: stack-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 3. MONITORING: INFLUXDB v2
+  # ==============================================================================
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: stack-influxdb
+    restart: unless-stopped
+    ports:
+      - "${INFLUXDB_PORT:-8086}:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD:-AdminPassword2026!}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-homelab}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-monitoring}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-admin-token-super-secret-2026}
+    healthcheck:
+      test: ["CMD-SHELL", "influx ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 4. MONITORING: TELEGRAF
+  # Metrics collector agent (Host + Docker -> InfluxDB)
+  # ==============================================================================
+  telegraf:
+    image: telegraf:1.30-alpine
+    container_name: stack-telegraf
+    restart: unless-stopped
+    environment:
+      HOST_MOUNT_PREFIX: /hostfs
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUXDB_TOKEN:-admin-token-super-secret-2026}
+      INFLUX_ORG: ${INFLUXDB_ORG:-homelab}
+      INFLUX_BUCKET: ${INFLUXDB_BUCKET:-monitoring}
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/hostfs:ro
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 5. MONITORING: GRAFANA
+  # Pre-provisioned InfluxDB v2 data source
+  # ==============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: stack-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-AdminPassword2026!}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "false"
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-admin-token-super-secret-2026}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-homelab}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-monitoring}
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 6. HONCHO (Plastic Labs AI Memory API)
+  # ==============================================================================
+  honcho-api:
+    image: ghcr.io/plastic-labs/honcho:latest
+    container_name: stack-honcho-api
+    restart: unless-stopped
+    command: ["sh", "docker/entrypoint.sh"]
+    ports:
+      - "${HONCHO_PORT:-8018}:8000"
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/honcho
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+      VECTOR_STORE_TYPE: pgvector
+      AUTH_USE_AUTH: "false"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 7. HONCHO DERIVER (AI Insight Background Worker)
+  # ==============================================================================
+  honcho-deriver:
+    image: ghcr.io/plastic-labs/honcho:latest
+    container_name: stack-honcho-deriver
+    restart: unless-stopped
+    command: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/honcho
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+      VECTOR_STORE_TYPE: pgvector
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      honcho-api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 8. N8N (Workflow Automation)
+  # ==============================================================================
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: stack-n8n
+    restart: unless-stopped
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-postgres}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-postgres123}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-n8n-super-secret-encryption-key-2026}
+      GENERIC_TIMEZONE: Europe/Bucharest
+      TZ: Europe/Bucharest
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      WEBHOOK_URL: http://localhost:${N8N_PORT:-5678}/
+      N8N_SECURE_COOKIE: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 9. HERMES HARNESS / AGENT
+  # Autonomous AI Agent, Gateway & Telegram Bridge
+  # ==============================================================================
+  hermes-agent:
+    image: nousresearch/hermes-agent:latest
+    container_name: stack-hermes-agent
+    restart: unless-stopped
+    ports:
+      - "${HERMES_GATEWAY_PORT:-8642}:8642"
+      - "${HERMES_DASHBOARD_PORT:-9119}:9119"
+    environment:
+      HERMES_UID: 1000
+      HERMES_GID: 1000
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      HONCHO_URL: http://honcho-api:8000
+    volumes:
+      - hermes_data:/opt/data
+      - ./hermes/config:/opt/data/config
+    depends_on:
+      - honcho-api
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 10. SUPABASE CORE: REST (PostgREST API)
+  # ==============================================================================
+  supabase-rest:
+    image: postgrest/postgrest:v12.0.1
+    container_name: stack-supabase-rest
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-with-at-least-32-chars-2026}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 11. SUPABASE CORE: AUTH (GoTrue Service)
+  # ==============================================================================
+  supabase-auth:
+    image: supabase/gotrue:v2.158.1
+    container_name: stack-supabase-auth
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      GOTRUE_DB_DRIVER: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/postgres?sslmode=disable
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-with-at-least-32-chars-2026}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_SITE_URL: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 12. SUPABASE CORE: KONG GATEWAY
+  # Single entry-point for Supabase API & Auth on port 8000
+  # ==============================================================================
+  supabase-kong:
+    image: kong:2.8.1-alpine
+    container_name: stack-supabase-kong
+    restart: unless-stopped
+    ports:
+      - "${KONG_HTTP_PORT:-8000}:8000"
+      - "${KONG_HTTPS_PORT:-8443}:8443"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+    volumes:
+      - ./kong/kong.yml:/home/kong/kong.yml:ro
+    depends_on:
+      - supabase-rest
+      - supabase-auth
+    networks:
+      - stack_net
+
+  # ==============================================================================
+  # 13. SUPABASE CORE: STUDIO (Web Database Management UI)
+  # ==============================================================================
+  supabase-studio:
+    image: supabase/studio:20240405-59b4333
+    container_name: stack-supabase-studio
+    restart: unless-stopped
+    ports:
+      - "${STUDIO_PORT:-3002}:3000"
+    environment:
+      STUDIO_PG_META_URL: http://supabase-kong:8000/pg
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres123}
+      SUPABASE_REST_URL: http://supabase-kong:8000/rest/v1/
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_ANON_KEY: ${ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN0YWNrIiwicm9sZSI6ImFub24iLCJpYXQiOjE2ODAxODAwMDAsImV4cCI6MTk5NTc0NDAwMH0.sample-anon-key}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN0YWNrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTY4MDE4MDAwMCwiZXhwIjoxOTk1NzQ0MDAwfQ.sample-service-key}
+    depends_on:
+      - supabase-kong
+    networks:
+      - stack_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  influxdb_data:
+  influxdb_config:
+  grafana_data:
+  n8n_data:
+  hermes_data:
