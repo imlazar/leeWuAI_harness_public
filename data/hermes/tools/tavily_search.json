@@ -1,0 +1,13 @@
+{
+  "name": "tavily_search",
+  "description": "Performs real-time web grounding for maritime entities: IMO vessel particulars, historical berth weather, and IMO/P&I regulations.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "Search query for factual grounding." },
+      "search_depth": { "type": "string", "enum": ["basic", "advanced"], "default": "basic" },
+      "include_domains": { "type": "array", "items": { "type": "string" } }
+    },
+    "required": ["query"]
+  }
+}
